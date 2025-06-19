@@ -15,6 +15,8 @@ enum wpanusb_requests {
 	TX,
 	XMIT_ASYNC,
 	ED,
+	SET_LBT,                    /* New: Listen Before Talk */
+	SET_FRAME_RETRIES,          /* New: Frame retry count */
 	SET_CHANNEL,
 	START,
 	STOP,
@@ -26,6 +28,7 @@ enum wpanusb_requests {
 	SET_CCA_ED_LEVEL,
 	SET_CSMA_PARAMS,
 	SET_PROMISCUOUS_MODE,
+	QUERY_SUPPORTED_POWERS,     /* New: Query power levels */
 };
 
 struct set_channel {
@@ -43,4 +46,43 @@ struct set_pan_id {
 
 struct set_ieee_addr {
 	__le64 ieee_addr;
+} __packed;
+
+struct set_txpower {
+	__le32 txpower;
+} __packed;
+
+struct set_cca_mode {
+	__u8 mode;
+	__u8 opt;
+} __packed;
+
+struct set_cca_ed_level {
+	__le32 ed_level;
+} __packed;
+
+struct set_csma_params {
+	__u8 min_be;
+	__u8 max_be;
+	__u8 retries;
+} __packed;
+
+struct set_promiscuous_mode {
+	__u8 promiscuous;
+} __packed;
+
+/* New structures for enhanced features */
+struct set_lbt {
+	__le32 sensing_time_us;
+	__le32 threshold_dbm;
+	__u8 enabled;
+} __packed;
+
+struct set_frame_retries {
+	__u8 retry_count;
+} __packed;
+
+struct power_level_response {
+	__u8 count;
+	__le32 powers[];
 } __packed;

@@ -27,6 +27,20 @@
 
 #define WPANUSB_VALID_CHANNELS	(0x07FFF800)
 
+/* Supported transmit power levels in mBm */
+static const s32 wpanusb_powers[] = {
+	500, 400, 300, 200, 100, 0, -100, -200, -300, -400, -500,
+	-600, -700, -800, -900, -1000, -1100, -1200, -1300, -1400,
+	-1500, -1600, -1700, -1800, -1900, -2000, -2100, -2200,
+	-2300, -2400, -2500, -2600, -2700, -2800, -2900, -3000
+};
+
+struct lbt_params {
+	u32 sensing_time_us;
+	s32 threshold_dbm;
+	bool enabled;
+};
+
 struct wpanusb {
 	struct ieee802154_hw *hw;
 	struct usb_device *udev;
@@ -42,6 +56,15 @@ struct wpanusb {
 	struct urb *tx_urb;
 	struct sk_buff *tx_skb;
 	u8 tx_ack_seq;			/* current TX ACK sequence number */
+
+	/* Enhanced features state */
+	struct lbt_params lbt_config;
+	int frame_retry_count;
+	s32 *supported_powers;
+	size_t supported_powers_size;
+	u8 min_be, max_be, csma_retries;
+	u8 cca_mode;
+	s32 cca_ed_level;
 };
 
 /* ----- USB commands without data ----------------------------------------- */
@@ -309,143 +332,27 @@ static int wpanusb_channel(struct ieee802154_hw *hw, u8 page, u8 channel)
 
 static int wpanusb_ed(struct ieee802154_hw *hw, u8 *level)
 {
+	struct wpanusb *wpanusb = hw->priv;
+	struct usb_device *udev = wpanusb->udev;
+	u8 ed_level;
+	int ret;
+
 	WARN_ON(!level);
 
-	*level = 0xbe;
+	ret = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
+                  ED, USB_TYPE_VENDOR | USB_DIR_IN,
+                  0, 0, &ed_level, sizeof(ed_level),
+                  USB_CTRL_GET_TIMEOUT);
+    
+    if (ret < 0) {
+        dev_err(&udev->dev, "Failed to perform ED, ret %d\n", ret);
+        *level = 0;
+        return ret;
+    }
 
-	return 0;
-}
-
-static int wpanusb_set_hw_addr_filt(struct ieee802154_hw *hw,
-				    struct ieee802154_hw_addr_filt *filt,
-				    unsigned long changed)
-{
-	struct wpanusb *wpanusb = hw->priv;
-	struct usb_device *udev = wpanusb->udev;
-	int ret = 0;
-
-	if (changed & IEEE802154_AFILT_SADDR_CHANGED) {
-		struct set_short_addr *req;
-
-		req = kmalloc(sizeof(*req), GFP_KERNEL);
-		if (!req)
-			return -ENOMEM;
-
-		req->short_addr = filt->short_addr;
-
-		ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
-					   SET_SHORT_ADDR, req, sizeof(*req));
-		kfree(req);
-		if (ret < 0) {
-			dev_err(&udev->dev, "Failed to set short_addr, ret %d",
-				ret);
-			return ret;
-		}
-
-		dev_dbg(&udev->dev, "short addr changed to 0x%04x",
-			le16_to_cpu(filt->short_addr));
-	}
-
-	if (changed & IEEE802154_AFILT_PANID_CHANGED) {
-		struct set_pan_id *req;
-
-		req = kmalloc(sizeof(*req), GFP_KERNEL);
-		if (!req)
-			return -ENOMEM;
-
-		req->pan_id = filt->pan_id;
-
-		ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
-					   SET_PAN_ID, req, sizeof(*req));
-		kfree(req);
-		if (ret < 0) {
-			dev_err(&udev->dev, "Failed to set pan_id, ret %d",
-				ret);
-			return ret;
-		}
-
-		dev_dbg(&udev->dev, "pan id changed to 0x%04x",
-			le16_to_cpu(filt->pan_id));
-	}
-
-	if (changed & IEEE802154_AFILT_IEEEADDR_CHANGED) {
-		struct set_ieee_addr *req;
-
-		req = kmalloc(sizeof(*req), GFP_KERNEL);
-		if (!req)
-			return -ENOMEM;
-
-		memcpy(&req->ieee_addr, &filt->ieee_addr,
-		       sizeof(req->ieee_addr));
-
-		ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
-					   SET_IEEE_ADDR, req, sizeof(*req));
-		kfree(req);
-		if (ret < 0) {
-			dev_err(&udev->dev, "Failed to set ieee_addr, ret %d",
-				ret);
-			return ret;
-		}
-
-		dev_dbg(&udev->dev, "IEEE addr changed");
-	}
-
-	if (changed & IEEE802154_AFILT_PANC_CHANGED) {
-		dev_dbg(&udev->dev, "panc changed");
-
-		dev_err(&udev->dev, "Not handled AFILT_PANC_CHANGED");
-	}
-
-	return ret;
-}
-
-static int wpanusb_start(struct ieee802154_hw *hw)
-{
-	struct wpanusb *wpanusb = hw->priv;
-	struct usb_device *udev = wpanusb->udev;
-	int ret;
-
-	schedule_delayed_work(&wpanusb->work, 0);
-
-	ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
-				   START, NULL, 0);
-	if (ret < 0) {
-		dev_err(&udev->dev, "Failed to start ieee802154");
-		usb_kill_anchored_urbs(&wpanusb->idle_urbs);
-	}
-
-	return ret;
-}
-
-static void wpanusb_stop(struct ieee802154_hw *hw)
-{
-	struct wpanusb *wpanusb = hw->priv;
-	struct usb_device *udev = wpanusb->udev;
-	int ret;
-
-	dev_dbg(&udev->dev, "stop");
-
-	usb_kill_anchored_urbs(&wpanusb->idle_urbs);
-
-	ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
-				   STOP, NULL, 0);
-	if (ret < 0)
-		dev_err(&udev->dev, "Failed to stop ieee802154");
-}
-
-static const s32 wpanusb_powers[] = {
-	300, 280, 230, 180, 130, 70, 0, -100, -200, -300, -400, -500, -700,
-	-900, -1200, -1700,
-};
-
-static int wpanusb_set_txpower(struct ieee802154_hw *hw, s32 mbm)
-{
-	struct wpanusb *wpanusb = hw->priv;
-	struct usb_device *udev = wpanusb->udev;
-
-	dev_err(&udev->dev, "%s: Not handled, mbm %d", __func__, mbm);
-
-	return -ENOTSUPP;
+    *level = ed_level;
+    dev_dbg(&udev->dev, "ED level: 0x%02x\n", ed_level);
+    return 0;
 }
 
 static int wpanusb_set_cca_mode(struct ieee802154_hw *hw,
@@ -453,21 +360,28 @@ static int wpanusb_set_cca_mode(struct ieee802154_hw *hw,
 {
 	struct wpanusb *wpanusb = hw->priv;
 	struct usb_device *udev = wpanusb->udev;
+	struct set_cca_mode *req;
+	int ret;
 
-	dev_err(&udev->dev, "%s: Not handled, mode %u opt %u",
-		__func__, cca->mode, cca->opt);
+	dev_dbg(&udev->dev, "Setting CCA mode %u opt %u\n", cca->mode, cca->opt);
 
-	switch (cca->mode) {
-	case NL802154_CCA_ENERGY:
-		break;
-	case NL802154_CCA_CARRIER:
-		break;
-	case NL802154_CCA_ENERGY_CARRIER:
-		break;
-	default:
-		return -EINVAL;
+	req = kmalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	req->mode = cca->mode;
+	req->opt = cca->opt;
+
+	ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
+				   SET_CCA_MODE, req, sizeof(*req));
+	kfree(req);
+	
+	if (ret < 0) {
+		dev_err(&udev->dev, "Failed to set CCA mode, ret %d\n", ret);
+		return ret;
 	}
 
+	wpanusb->cca_mode = cca->mode;
 	return 0;
 }
 
@@ -475,9 +389,27 @@ static int wpanusb_set_cca_ed_level(struct ieee802154_hw *hw, s32 mbm)
 {
 	struct wpanusb *wpanusb = hw->priv;
 	struct usb_device *udev = wpanusb->udev;
+	struct set_cca_ed_level *req;
+	int ret;
 
-	dev_err(&udev->dev, "%s: Not handled, mbm %d", __func__, mbm);
+	dev_dbg(&udev->dev, "Setting CCA ED level: %d mBm\n", mbm);
 
+	req = kmalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	req->ed_level = cpu_to_le32(mbm);
+
+	ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
+				   SET_CCA_ED_LEVEL, req, sizeof(*req));
+	kfree(req);
+	
+	if (ret < 0) {
+		dev_err(&udev->dev, "Failed to set CCA ED level, ret %d\n", ret);
+		return ret;
+	}
+
+	wpanusb->cca_ed_level = mbm;
 	return 0;
 }
 
@@ -486,9 +418,38 @@ static int wpanusb_set_csma_params(struct ieee802154_hw *hw, u8 min_be,
 {
 	struct wpanusb *wpanusb = hw->priv;
 	struct usb_device *udev = wpanusb->udev;
+	struct set_csma_params *req;
+	int ret;
 
-	dev_err(&udev->dev, "%s: Not handled, min_be %u max_be %u retr %u",
-		__func__, min_be, max_be, retries);
+	dev_dbg(&udev->dev, "Setting CSMA params: min_be=%u, max_be=%u, retries=%u\n",
+		min_be, max_be, retries);
+
+	if (min_be > max_be || max_be > 8 || retries > 7) {
+		dev_err(&udev->dev, "Invalid CSMA parameters\n");
+		return -EINVAL;
+	}
+
+	req = kmalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	req->min_be = min_be;
+	req->max_be = max_be;
+	req->retries = retries;
+
+	ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
+				   SET_CSMA_PARAMS, req, sizeof(*req));
+	kfree(req);
+	
+	if (ret < 0) {
+		dev_err(&udev->dev, "Failed to set CSMA params, ret %d\n", ret);
+		return ret;
+	}
+
+	wpanusb->min_be = min_be;
+	wpanusb->max_be = max_be;
+	wpanusb->csma_retries = retries;
+	wpanusb->frame_retry_count = retries;
 
 	return 0;
 }
@@ -497,25 +458,104 @@ static int wpanusb_set_promiscuous_mode(struct ieee802154_hw *hw, const bool on)
 {
 	struct wpanusb *wpanusb = hw->priv;
 	struct usb_device *udev = wpanusb->udev;
+	struct set_promiscuous_mode *req;
+	int ret;
 
-	dev_err(&udev->dev, "%s: Not handled, on %d", __func__, on);
+	dev_dbg(&udev->dev, "Setting promiscuous mode: %s\n", on ? "on" : "off");
+
+	req = kmalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	req->promiscuous = on ? 1 : 0;
+
+	ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
+				   SET_PROMISCUOUS_MODE, req, sizeof(*req));
+	kfree(req);
+	
+	if (ret < 0) {
+		dev_err(&udev->dev, "Failed to set promiscuous mode, ret %d\n", ret);
+		return ret;
+	}
 
 	return 0;
 }
 
+/* LBT implementation */
+static int wpanusb_set_lbt(struct wpanusb *wpanusb, struct lbt_params *params)
+{
+    struct usb_device *udev = wpanusb->udev;
+    struct set_lbt *req;
+    int ret;
+
+    if (!params)
+        return -EINVAL;
+
+    if (params->sensing_time_us < 50 || params->sensing_time_us > 10000)
+        return -EINVAL;
+
+    if (params->threshold_dbm < -100 || params->threshold_dbm > 0)
+        return -EINVAL;
+
+    req = kmalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+
+    req->sensing_time_us = cpu_to_le32(params->sensing_time_us);
+    req->threshold_dbm = cpu_to_le32(params->threshold_dbm);
+    req->enabled = params->enabled ? 1 : 0;
+
+    ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
+                   SET_LBT, req, sizeof(*req));
+    kfree(req);
+    
+    if (ret < 0) {
+        dev_err(&udev->dev, "Failed to set LBT parameters, ret %d\n", ret);
+        return ret;
+    }
+
+    wpanusb->lbt_config = *params;
+    return 0;
+}
+
+/* Frame retry implementation */
+static int wpanusb_set_frame_retries(struct wpanusb *wpanusb, int retry_count)
+{
+	struct usb_device *udev = wpanusb->udev;
+	struct set_frame_retries *req;
+	int ret;
+
+	if (retry_count < 0 || retry_count > 7)
+		return -EINVAL;
+
+	req = kmalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	req->retry_count = (u8)retry_count;
+
+	ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0),
+				   SET_FRAME_RETRIES, req, sizeof(*req));
+	kfree(req);
+	
+	if (ret < 0) {
+		dev_err(&udev->dev, "Failed to set frame retries, ret %d\n", ret);
+		return ret;
+	}
+
+	wpanusb->frame_retry_count = retry_count;
+	return 0;
+}
+
 static const struct ieee802154_ops wpanusb_ops = {
-	.owner			= THIS_MODULE,
-	.xmit_async		= wpanusb_xmit,
-	.ed			= wpanusb_ed,
-	.set_channel		= wpanusb_channel,
-	.start			= wpanusb_start,
-	.stop			= wpanusb_stop,
-	.set_hw_addr_filt	= wpanusb_set_hw_addr_filt,
-	.set_txpower		= wpanusb_set_txpower,
-	.set_cca_mode		= wpanusb_set_cca_mode,
-	.set_cca_ed_level	= wpanusb_set_cca_ed_level,
-	.set_csma_params	= wpanusb_set_csma_params,
-	.set_promiscuous_mode	= wpanusb_set_promiscuous_mode,
+	.owner = THIS_MODULE,
+	.xmit_sync = wpanusb_xmit,
+	.ed = wpanusb_ed,
+	.set_channel = wpanusb_channel,
+	.set_cca_mode = wpanusb_set_cca_mode,
+	.set_cca_ed_level = wpanusb_set_cca_ed_level,
+	.set_csma_params = wpanusb_set_csma_params,
+	.set_promiscuous_mode = wpanusb_set_promiscuous_mode,
 };
 
 /* ----- Setup ------------------------------------------------------------- */
@@ -583,6 +623,17 @@ static int wpanusb_probe(struct usb_interface *interface,
 		dev_err(&udev->dev, "Failed to register ieee802154");
 		goto fail;
 	}
+
+	/* Initialize enhanced feature state */
+	wpanusb->lbt_config.enabled = false;
+	wpanusb->lbt_config.sensing_time_us = 1000;
+	wpanusb->lbt_config.threshold_dbm = -70;
+	wpanusb->frame_retry_count = 3;
+	wpanusb->min_be = 3;
+	wpanusb->max_be = 5;
+	wpanusb->csma_retries = 3;
+	wpanusb->cca_mode = NL802154_CCA_ENERGY;
+	wpanusb->cca_ed_level = -7000;
 
 	return 0;
 
