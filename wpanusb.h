@@ -29,6 +29,7 @@ enum wpanusb_requests {
 	SET_CSMA_PARAMS,
 	SET_PROMISCUOUS_MODE,
 	QUERY_SUPPORTED_POWERS,     /* New: Query power levels */
+	QUERY_SUPPORTED_CHANNELS,   /* New: Query channel support */
 };
 
 struct set_channel {
@@ -85,4 +86,22 @@ struct set_frame_retries {
 struct power_level_response {
 	__u8 count;
 	__le32 powers[];
+} __packed;
+
+/* New structures for dynamic querying */
+struct channel_support_query {
+	__u8 page;
+} __packed;
+
+struct channel_support_response {
+	__u8 page;
+	__u8 channel_count;
+	__u8 channels[];  /* List of supported channels */
+} __packed;
+
+struct power_query_response {
+	__u8 count;
+	__le32 min_power_mbm;
+	__le32 max_power_mbm;
+	__le32 power_levels[];  /* Array of supported power levels in mBm */
 } __packed;
