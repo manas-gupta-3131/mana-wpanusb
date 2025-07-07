@@ -27,6 +27,14 @@
 
 #define WPANUSB_VALID_CHANNELS	(0x07FFF800)
 
+/* Supported transmit power levels in mBm */
+static const s32 wpanusb_powers[] = {
+	500, 400, 300, 200, 100, 0, -100, -200, -300, -400, -500,
+	-600, -700, -800, -900, -1000, -1100, -1200, -1300, -1400,
+	-1500, -1600, -1700, -1800, -1900, -2000, -2100, -2200,
+	-2300, -2400, -2500, -2600, -2700, -2800, -2900, -3000
+};
+
 struct lbt_params {
 	u32 sensing_time_us;
 	s32 threshold_dbm;
@@ -57,11 +65,6 @@ struct wpanusb {
 	u8 min_be, max_be, csma_retries;
 	u8 cca_mode;
 	s32 cca_ed_level;
-
-	/* Dynamic channel and power support */
-	u32 supported_channels[3]; /* Up to 3 channel pages */
-	u32 channel_pages_supported;
-	s32 min_power_mbm, max_power_mbm;
 };
 
 /* ----- USB commands without data ----------------------------------------- */
@@ -544,172 +547,6 @@ static int wpanusb_set_frame_retries(struct wpanusb *wpanusb, int retry_count)
 	return 0;
 }
 
-/* Dynamic power level querying */
-static int wpanusb_query_tx_power_levels(struct wpanusb *wpanusb)
-{
-	struct usb_device *udev = wpanusb->udev;
-	struct power_query_response *resp;
-	s32 *powers;
-	int ret, i;
-	u8 buffer[256]; /* Buffer for USB response */
-
-	dev_dbg(&udev->dev, "Querying supported TX power levels\n");
-
-	/* Send USB control request to query power levels */
-	ret = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
-			      QUERY_SUPPORTED_POWERS, USB_TYPE_VENDOR | USB_DIR_IN,
-			      0, 0, buffer, sizeof(buffer),
-			      USB_CTRL_GET_TIMEOUT);
-	
-	if (ret < 0) {
-		dev_warn(&udev->dev, "Failed to query power levels, using defaults: %d\n", ret);
-		goto use_defaults;
-	}
-
-	if (ret < sizeof(struct power_query_response)) {
-		dev_warn(&udev->dev, "Invalid power query response size: %d\n", ret);
-		goto use_defaults;
-	}
-
-	resp = (struct power_query_response *)buffer;
-	
-	if (resp->count == 0 || resp->count > 64) {
-		dev_warn(&udev->dev, "Invalid power level count: %u\n", resp->count);
-		goto use_defaults;
-	}
-
-	/* Allocate dynamic power array */
-	powers = kmalloc_array(resp->count, sizeof(s32), GFP_KERNEL);
-	if (!powers) {
-		dev_err(&udev->dev, "Failed to allocate power array\n");
-		return -ENOMEM;
-	}
-
-	/* Convert little-endian response to host byte order */
-	for (i = 0; i < resp->count; i++) {
-		powers[i] = le32_to_cpu(resp->power_levels[i]);
-	}
-
-	/* Free existing array if present */
-	kfree(wpanusb->supported_powers);
-
-	/* Update driver state */
-	wpanusb->supported_powers = powers;
-	wpanusb->supported_powers_size = resp->count;
-	wpanusb->min_power_mbm = le32_to_cpu(resp->min_power_mbm);
-	wpanusb->max_power_mbm = le32_to_cpu(resp->max_power_mbm);
-
-	dev_info(&udev->dev, "Queried %u power levels (range: %d to %d mBm)\n",
-		 resp->count, wpanusb->min_power_mbm, wpanusb->max_power_mbm);
-
-	return 0;
-
-use_defaults:
-	/* Fallback to hard-coded defaults */
-	static const s32 default_powers[] = {
-		500, 400, 300, 200, 100, 0, -100, -200, -300, -400, -500,
-		-600, -700, -800, -900, -1000, -1100, -1200, -1300, -1400,
-		-1500, -1600, -1700, -1800, -1900, -2000, -2100, -2200,
-		-2300, -2400, -2500, -2600, -2700, -2800, -2900, -3000
-	};
-
-	powers = kmalloc_array(ARRAY_SIZE(default_powers), sizeof(s32), GFP_KERNEL);
-	if (!powers)
-		return -ENOMEM;
-
-	memcpy(powers, default_powers, sizeof(default_powers));
-	
-	kfree(wpanusb->supported_powers);
-	wpanusb->supported_powers = powers;
-	wpanusb->supported_powers_size = ARRAY_SIZE(default_powers);
-	wpanusb->min_power_mbm = default_powers[ARRAY_SIZE(default_powers) - 1];
-	wpanusb->max_power_mbm = default_powers[0];
-
-	dev_info(&udev->dev, "Using default power levels (%zu levels)\n",
-		 ARRAY_SIZE(default_powers));
-
-	return 0;
-}
-
-/* Dynamic channel support querying */
-static int wpanusb_query_supported_channels(struct wpanusb *wpanusb)
-{
-	struct usb_device *udev = wpanusb->udev;
-	struct channel_support_query query;
-	struct channel_support_response *resp;
-	u8 buffer[256];
-	int ret, page, i;
-	u32 channel_mask;
-
-	dev_dbg(&udev->dev, "Querying supported channels\n");
-
-	/* Initialize channel support to empty */
-	memset(wpanusb->supported_channels, 0, sizeof(wpanusb->supported_channels));
-
-	/* Query channels for each page (0 = 2.4GHz, 2 = Sub-GHz) */
-	for (page = 0; page <= 2; page++) {
-		if (page == 1) continue; /* Skip page 1 (not commonly used) */
-
-		query.page = page;
-
-		ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
-				      QUERY_SUPPORTED_CHANNELS, USB_TYPE_VENDOR | USB_DIR_OUT,
-				      0, 0, &query, sizeof(query),
-				      USB_CTRL_SET_TIMEOUT);
-		if (ret < 0) {
-			dev_dbg(&udev->dev, "Failed to send channel query for page %d: %d\n", page, ret);
-			continue;
-		}
-
-		ret = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
-				      QUERY_SUPPORTED_CHANNELS, USB_TYPE_VENDOR | USB_DIR_IN,
-				      0, 0, buffer, sizeof(buffer),
-				      USB_CTRL_GET_TIMEOUT);
-		
-		if (ret < sizeof(struct channel_support_response)) {
-			dev_dbg(&udev->dev, "Invalid channel response for page %d: %d\n", page, ret);
-			continue;
-		}
-
-		resp = (struct channel_support_response *)buffer;
-		
-		if (resp->page != page) {
-			dev_warn(&udev->dev, "Page mismatch in response: expected %d, got %d\n", 
-				 page, resp->page);
-			continue;
-		}
-
-		if (resp->channel_count > 32) {
-			dev_warn(&udev->dev, "Too many channels for page %d: %u\n", 
-				 page, resp->channel_count);
-			continue;
-		}
-
-		/* Convert channel list to bitmask */
-		channel_mask = 0;
-		for (i = 0; i < resp->channel_count; i++) {
-			if (resp->channels[i] < 32) {
-				channel_mask |= BIT(resp->channels[i]);
-			}
-		}
-
-		wpanusb->supported_channels[page] = channel_mask;
-		wpanusb->channel_pages_supported |= BIT(page);
-
-		dev_info(&udev->dev, "Page %d: %u channels supported (mask: 0x%08x)\n",
-			 page, resp->channel_count, channel_mask);
-	}
-
-	/* Fallback to default channels if query failed */
-	if (wpanusb->channel_pages_supported == 0) {
-		dev_info(&udev->dev, "Channel query failed, using defaults\n");
-		wpanusb->supported_channels[0] = 0x07FFF800; /* Channels 11-26 for 2.4GHz */
-		wpanusb->channel_pages_supported = BIT(0);
-	}
-
-	return 0;
-}
-
 static const struct ieee802154_ops wpanusb_ops = {
 	.owner = THIS_MODULE,
 	.xmit_sync = wpanusb_xmit,
@@ -763,11 +600,17 @@ static int wpanusb_probe(struct usb_interface *interface,
 
 	hw->phy->flags = WPAN_PHY_FLAG_TXPOWER;
 
-	/* Set default and supported channels - will be updated by query */
+	/* Set default and supported channels */
 	hw->phy->current_page = 0;
 	hw->phy->current_channel = 11;
+	hw->phy->supported.channels[0] = WPANUSB_VALID_CHANNELS;
 
-	/* Reset device first */
+	hw->phy->supported.tx_powers = wpanusb_powers;
+	hw->phy->supported.tx_powers_size = ARRAY_SIZE(wpanusb_powers);
+	hw->phy->transmit_power = hw->phy->supported.tx_powers[0];
+
+	ieee802154_random_extended_addr(&hw->phy->perm_extended_addr);
+
 	ret = wpanusb_control_send(wpanusb, usb_sndctrlpipe(udev, 0), RESET,
 				   NULL, 0);
 	if (ret < 0) {
@@ -775,32 +618,11 @@ static int wpanusb_probe(struct usb_interface *interface,
 		goto fail;
 	}
 
-	/* Query dynamic capabilities from firmware */
-	ret = wpanusb_query_tx_power_levels(wpanusb);
-	if (ret < 0) {
-		dev_err(&udev->dev, "Failed to query power levels");
+	ret = ieee802154_register_hw(hw);
+	if (ret) {
+		dev_err(&udev->dev, "Failed to register ieee802154");
 		goto fail;
 	}
-
-	ret = wpanusb_query_supported_channels(wpanusb);
-	if (ret < 0) {
-		dev_err(&udev->dev, "Failed to query supported channels");
-		goto fail;
-	}
-
-	/* Update hardware capabilities with queried data */
-	hw->phy->supported.tx_powers = wpanusb->supported_powers;
-	hw->phy->supported.tx_powers_size = wpanusb->supported_powers_size;
-	hw->phy->transmit_power = wpanusb->supported_powers[0];
-
-	/* Set supported channels for all queried pages */
-	for (int page = 0; page < 3; page++) {
-		if (wpanusb->channel_pages_supported & BIT(page)) {
-			hw->phy->supported.channels[page] = wpanusb->supported_channels[page];
-		}
-	}
-
-	ieee802154_random_extended_addr(&hw->phy->perm_extended_addr);
 
 	/* Initialize enhanced feature state */
 	wpanusb->lbt_config.enabled = false;
@@ -812,28 +634,10 @@ static int wpanusb_probe(struct usb_interface *interface,
 	wpanusb->csma_retries = 3;
 	wpanusb->cca_mode = NL802154_CCA_ENERGY;
 	wpanusb->cca_ed_level = -7000;
-	
-	/* Initialize dynamic capability fields */
-	wpanusb->supported_powers = NULL;
-	wpanusb->supported_powers_size = 0;
-	wpanusb->channel_pages_supported = 0;
-	wpanusb->min_power_mbm = 0;
-	wpanusb->max_power_mbm = 0;
-	memset(wpanusb->supported_channels, 0, sizeof(wpanusb->supported_channels));
-
-	ret = ieee802154_register_hw(hw);
-	if (ret) {
-		dev_err(&udev->dev, "Failed to register ieee802154");
-		goto fail;
-	}
-
-	dev_info(&udev->dev, "WPANUSB IEEE 802.15.4 device registered with enhanced features\n");
 
 	return 0;
 
 fail:
-	/* Cleanup dynamic arrays */
-	kfree(wpanusb->supported_powers);
 	wpanusb_free_urbs(wpanusb);
 	usb_kill_urb(wpanusb->tx_urb);
 	usb_free_urb(wpanusb->tx_urb);
@@ -854,9 +658,6 @@ static void wpanusb_disconnect(struct usb_interface *interface)
 	wpanusb_free_urbs(wpanusb);
 	usb_kill_urb(wpanusb->tx_urb);
 	usb_free_urb(wpanusb->tx_urb);
-
-	/* Free dynamic arrays */
-	kfree(wpanusb->supported_powers);
 
 	ieee802154_unregister_hw(wpanusb->hw);
 
